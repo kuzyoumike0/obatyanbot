@@ -4,7 +4,30 @@ import uuid
 import random
 import asyncio
 import discord
+import shutil
+import discord
+
+def boot_diagnostics():
+    print("[diag] ffmpeg:", shutil.which("ffmpeg"))
+    try:
+        import subprocess
+        v = subprocess.check_output(["ffmpeg", "-version"]).decode("utf-8").splitlines()[0]
+        print("[diag]", v)
+    except Exception as e:
+        print("[diag] ffmpeg check failed:", e)
+
+    # opus確認（無音原因の特効薬）
+    try:
+        if not discord.opus.is_loaded():
+            discord.opus.load_opus("libopus.so.0")
+        print("[diag] opus loaded:", discord.opus.is_loaded())
+    except Exception as e:
+        print("[diag] opus load failed:", e)
+
+boot_diagnostics()
+
 from discord.ext import commands
+
 
 # =====================
 # ENV
