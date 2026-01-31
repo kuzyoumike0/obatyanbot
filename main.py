@@ -6,6 +6,25 @@ import asyncio
 import shutil
 import subprocess
 import discord
+import shutil
+import subprocess
+import discord
+
+print("=== BOOT DIAG ===")
+print("[diag] ffmpeg:", shutil.which("ffmpeg"))
+try:
+    print("[diag]", subprocess.check_output(["ffmpeg", "-version"]).decode().splitlines()[0])
+except Exception as e:
+    print("[diag] ffmpeg check failed:", e)
+
+try:
+    if not discord.opus.is_loaded():
+        discord.opus.load_opus("libopus.so.0")
+    print("[diag] opus loaded:", discord.opus.is_loaded())
+except Exception as e:
+    print("[diag] opus load failed:", e)
+print("==================")
+
 from discord.ext import commands
 
 # =====================
