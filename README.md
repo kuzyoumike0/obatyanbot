@@ -1,27 +1,28 @@
-# おばちゃんbot（Discord + OpenAI）
+# おばちゃんBot（全文読み上げ / 送信者VC参加）
 
-文頭が「おばちゃん」で始まると反応する、世話焼きおばちゃんAI Bot。
+チャットで「おばちゃん〜」と送ると、
+返答（4行）をテキスト返信しつつ、
+送信者が入っているVCにBotが入って全文読み上げします（無料TTS: edge-tts）。
 
-## 使い方
-- `おばちゃん` → 「どしたん？」
-- `おばちゃんしんどい`
-- `おばちゃん 今日ほんま疲れた`
-- `おばちゃん 恋の相談していい？`
-
-## 特徴
-- 呼ばれた時だけ反応（文頭「おばちゃん」）
-- 直近3往復の短期記憶（チャンネル単位）
-- OpenAI Responses API（推奨）でAI反応
-- 返答は必ず4行以内（強制カットあり）
-- センシティブ内容は安心・安全確認・支援先へのやさしい誘導
+## 必須
+- Bot権限（サーバー側）
+  - View Channel
+  - Connect
+  - Speak
+  - Send Messages / Read Message History
+- Discord Developer Portal
+  - MESSAGE CONTENT INTENT を ON
+- 実行環境に ffmpeg が必要
 
 ## 環境変数
 - DISCORD_TOKEN（必須）
-- OPENAI_API_KEY（任意：ない場合は定型返し）
-- OPENAI_MODEL（任意：デフォルト gpt-4.1-mini）
+- DEBUG_LOG（任意）: 1でログ増える
+- TTS_VOICE（任意）: 例 ja-JP-NanamiNeural / ja-JP-KeitaNeural
+- TTS_RATE（任意）: 例 "+10%"
+- TTS_VOLUME（任意）: 例 "+10%"
 
-## Railwayデプロイ
-1. GitHubへpush
-2. RailwayでDeploy from GitHub
-3. VariablesにDISCORD_TOKEN / OPENAI_API_KEYを設定
-4. 起動
+## ローカル起動
+```bash
+pip install -r requirements.txt
+export DISCORD_TOKEN="..."
+python main.py
