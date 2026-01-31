@@ -13,13 +13,13 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DEBUG_LOG = os.getenv("DEBUG_LOG", "0") == "1"
 
 # 関西おばちゃん寄り（環境変数で調整）
-TTS_VOICE  = os.getenv("TTS_VOICE", "ja-JP-NanamiNeural")  # 例: ja-JP-KeitaNeural
-TTS_RATE   = os.getenv("TTS_RATE", "+15%")                 # 早口気味
-TTS_PITCH  = os.getenv("TTS_PITCH", "+2Hz")                # 少し高め
-TTS_VOLUME = os.getenv("TTS_VOLUME", "+10%")               # 少し大きめ
+TTS_VOICE  = os.getenv("TTS_VOICE", "ja-JP-NanamiNeural")
+TTS_RATE   = os.getenv("TTS_RATE", "+15%")
+TTS_PITCH  = os.getenv("TTS_PITCH", "+2Hz")
+TTS_VOLUME = os.getenv("TTS_VOLUME", "+10%")
 
 # 入退室しゃべりのクールダウン（秒）
-VC_EVENT_COOLDOWN_SEC = int(os.getenv("VC_EVENT_COOLDOWN_SEC", "6"))
+VC_EVENT_COOLDOWN_SEC = int(os.getenv("VC_EVENT_COOLDOWN_SEC", "10"))
 
 # =====================
 # Intents
@@ -35,17 +35,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =====================
 # 状態管理（ギルドごと）
 # =====================
-# 常駐先VC（guild_id -> voice_channel_id）
-STAY_VC: dict[int, int] = {}
-
-# 再生キュー（guild_id -> asyncio.Queue[str])
+STAY_VC: dict[int, int] = {}  # guild_id -> voice_channel_id
 SPEAK_Q: dict[int, asyncio.Queue] = {}
-
-# 再生タスク（guild_id -> asyncio.Task）
 SPEAK_TASK: dict[int, asyncio.Task] = {}
-
-# 入退室喋りの連打抑制
-LAST_VC_EVENT_AT: dict[tuple[int, int], float] = {}  # (guild_id, user_id) -> monotonic time
+LAST_VC_EVENT_AT: dict[tuple[int, int], float] = {}  # (guild_id, user_id) -> monotonic
 
 # =====================
 # ユーティリティ
@@ -82,7 +75,7 @@ async def safe_respond(message: discord.Message, text: str):
         print("[send failed]", e)
 
 # =====================
-# おばちゃん文章（4行固定）
+# おばちゃん文章（チャット返信は4行固定）
 # =====================
 TAILS = ["やで", "やん", "しよか", "せやな", "ほな", "大丈夫や"]
 PAUSES = ["…", ""]
@@ -167,28 +160,52 @@ def make_reply(category: str, call_name: str) -> str:
     return "\n".join([line1, line2, line3, line4])
 
 # =====================
-# TTS（edge-tts）＋関西っぽい“間”整形
+# 短文だけ「語尾の揺れ」を強める
 # =====================
-def to_kansai_speak(full_reply: str) -> str:
-    """
-    4行を“しゃべり向き”に整形：
-    - 行の終わりに軽い間
-    - 読み上げ長すぎ防止
-    """
-    lines = [l.strip() for l in full_reply.split("\n") if l.strip()][:4]
+SHORT_TAILS = [
+    "やで", "やんな", "ほなな", "せやで", "せやんな",
+    "ええやん", "かまへん", "無理すなや",
+]
 
-    # 関西っぽい間（「…」と「、」でノリを作る）
-    # 句点を増やすと、抑揚っぽく聞こえることがある
+def add_short_tail(text: str) -> str:
+    """
+    入退室の一言だけ語尾を強める（うるさくしない範囲で）
+    """
+    t = text.strip()
+    # すでに語尾っぽいのがあるならそのまま
+    if any(t.endswith(x) for x in ["やで", "やんな", "ほなな", "せやで", "せやんな", "ええやん", "かまへん"]):
+        return t
+    # たまに語尾なしも混ぜて“くどさ”を減らす
+    if random.random() < 0.20:
+        return t
+    return f"{t}{random.choice(SHORT_TAILS)}"
+
+# =====================
+# TTS（edge-tts）整形
+# =====================
+def to_kansai_speak(text: str, short: bool) -> str:
+    """
+    short=True: 一言用（語尾強め＋短く）
+    short=False: 4行全文用（チャット/VCチャットはこれ）
+    """
+    if short:
+        t = add_short_tail(text)
+        t = t.replace("、", "、 ").replace("。", "。 ")
+        if len(t) > 70:
+            t = t[:70] + "…"
+        return t + "。"
+
+    lines = [l.strip() for l in text.split("\n") if l.strip()][:4]
     cooked = []
-    for i, ln in enumerate(lines):
+    for ln in lines:
         ln = ln.replace("やで🙂", "やで。🙂")
-        ln = ln.replace("やで", "やで、") if ("やで" in ln and "やで、" not in ln) else ln
-        ln = ln.replace("やん", "やん、") if ("やん" in ln and "やん、" not in ln) else ln
+        if "やで" in ln and "やで、" not in ln:
+            ln = ln.replace("やで", "やで、")
+        if "やん" in ln and "やん、" not in ln:
+            ln = ln.replace("やん", "やん、")
         cooked.append(ln)
 
     speak = "… ".join(cooked) + "。"
-
-    # 上限（荒らし/負荷対策）
     if len(speak) > 260:
         speak = speak[:260] + "…"
     return speak
@@ -232,19 +249,14 @@ async def play_mp3(vc: discord.VoiceClient, mp3_path: str):
     await done.wait()
 
 async def speaker_worker(guild_id: int):
-    """
-    ギルドごとの再生ワーカー：
-    キューに入った音声を順番に再生する。
-    """
     q = await ensure_queue(guild_id)
-
     while True:
         item = await q.get()
         if item is None:
             q.task_done()
             return
 
-        (voice_channel_id, text) = item
+        voice_channel_id, raw_text, short = item
         try:
             guild = bot.get_guild(guild_id)
             if guild is None:
@@ -259,7 +271,7 @@ async def speaker_worker(guild_id: int):
             vc = await get_or_connect_vc(guild, ch)
             tmp = f"tts_{uuid.uuid4().hex}.mp3"
 
-            speak_text = to_kansai_speak(text)
+            speak_text = to_kansai_speak(raw_text, short=short)
             if DEBUG_LOG:
                 print("[TTS]", speak_text)
 
@@ -271,7 +283,7 @@ async def speaker_worker(guild_id: int):
             except Exception:
                 pass
 
-            # 常駐先が設定されていないなら、再生後に退出
+            # 常駐先が無ければ退出
             if STAY_VC.get(guild_id) is None:
                 try:
                     await vc.disconnect(force=True)
@@ -280,25 +292,20 @@ async def speaker_worker(guild_id: int):
 
         except Exception as e:
             print("[speaker_worker error]", e)
-
         finally:
             q.task_done()
 
-async def enqueue_speech(guild_id: int, voice_channel_id: int, full_reply: str):
+async def enqueue_speech(guild_id: int, voice_channel_id: int, text: str, short: bool):
     q = await ensure_queue(guild_id)
-    await q.put((voice_channel_id, full_reply))
-
+    await q.put((voice_channel_id, text, short))
     if guild_id not in SPEAK_TASK or SPEAK_TASK[guild_id].done():
         SPEAK_TASK[guild_id] = asyncio.create_task(speaker_worker(guild_id))
 
 # =====================
-# VC常駐コマンド（プレフィックス）
+# VC常駐コマンド
 # =====================
 @bot.command(name="join")
 async def join_cmd(ctx: commands.Context):
-    """
-    !join  : コマンド実行者がいるVCに常駐
-    """
     if not isinstance(ctx.author, discord.Member):
         return
     if not ctx.author.voice or not ctx.author.voice.channel:
@@ -307,8 +314,6 @@ async def join_cmd(ctx: commands.Context):
     vc_ch = ctx.author.voice.channel
     STAY_VC[ctx.guild.id] = vc_ch.id
     await ctx.send(f"ほな、ここ常駐するわ：{vc_ch.name}")
-
-    # ついでに接続しておく
     try:
         await get_or_connect_vc(ctx.guild, vc_ch)
     except Exception as e:
@@ -316,9 +321,6 @@ async def join_cmd(ctx: commands.Context):
 
 @bot.command(name="leave")
 async def leave_cmd(ctx: commands.Context):
-    """
-    !leave : 常駐解除して退出
-    """
     gid = ctx.guild.id
     STAY_VC.pop(gid, None)
     vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
@@ -330,19 +332,21 @@ async def leave_cmd(ctx: commands.Context):
     await ctx.send("ほな、また呼んでな。")
 
 # =====================
-# 入退室で喋る（常駐中のみ）
+# 入退室：短く一言だけ（語尾強め）
 # =====================
-JOIN_VOICE = [
-    "{name}来たん？ えらいえらい。無理せんと座り。",
-    "{name}おかえりやで。まず息しよか。",
+JOIN_ONE = [
+    "{name}来たん？ えらい",
+    "{name}おかえり",
+    "{name}無理せんと",
 ]
-LEAVE_VOICE = [
-    "{name}抜けたんやな。おつかれさん、ちゃんと休みや。",
-    "{name}、またな。来れた時点で勝ちやで。",
+LEAVE_ONE = [
+    "{name}おつかれ",
+    "{name}またな",
+    "{name}休みや",
 ]
-MOVE_VOICE = [
-    "{name}部屋移動したんやな。迷子なってへん？",
-    "{name}移動おつ。落ち着くとこ行こか。",
+MOVE_ONE = [
+    "{name}移動おつ",
+    "{name}そっちやな",
 ]
 
 @bot.event
@@ -354,45 +358,43 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
     stay_id = STAY_VC.get(gid)
     if not stay_id:
-        return  # 常駐してないなら喋らない
+        return
 
-    # 送信するVCは「常駐VC」
-    # （入退室した人が別VCだったら喋らない、が自然）
     target_vc = guild.get_channel(stay_id)
     if not isinstance(target_vc, discord.VoiceChannel):
         return
 
-    # クールダウン（同じ人の連打抑制）
+    # クールダウン（同一人物の連打抑制）
     key = (gid, member.id)
     last = LAST_VC_EVENT_AT.get(key, 0.0)
     if now_mono() - last < VC_EVENT_COOLDOWN_SEC:
         return
     LAST_VC_EVENT_AT[key] = now_mono()
 
-    # 参加/退出/移動 判定
     name = make_call_name(member)
 
-    # 参加：None -> target_vc
+    # 参加（target VCに入ったときだけ）
     if before.channel is None and after.channel and after.channel.id == target_vc.id:
-        text = random.choice(JOIN_VOICE).format(name=name)
-        await enqueue_speech(gid, target_vc.id, text + "\n" + "ほな、ゆっくりしよか。\n" + "来れた時点で偉い。\n" + "今日は何があったん？")
+        text = random.choice(JOIN_ONE).format(name=name)
+        await enqueue_speech(gid, target_vc.id, text, short=True)
         return
 
-    # 退出：target_vc -> None
+    # 退出（target VCから抜けたときだけ）
     if before.channel and before.channel.id == target_vc.id and after.channel is None:
-        text = random.choice(LEAVE_VOICE).format(name=name)
-        await enqueue_speech(gid, target_vc.id, text + "\n" + "無理は禁物やで。\n" + "今日はよう頑張った。\n" + "あったかくして寝ぇ。")
+        text = random.choice(LEAVE_ONE).format(name=name)
+        await enqueue_speech(gid, target_vc.id, text, short=True)
         return
 
-    # 移動：target_vc <-> 別VC
+    # 移動（target VCに出入りが絡む時だけ）
     if before.channel and after.channel and before.channel.id != after.channel.id:
         if before.channel.id == target_vc.id or after.channel.id == target_vc.id:
-            text = random.choice(MOVE_VOICE).format(name=name)
-            await enqueue_speech(gid, target_vc.id, text + "\n" + "落ち着く場所が正解や。\n" + "ええ判断やで。\n" + "水飲んどき。")
+            text = random.choice(MOVE_ONE).format(name=name)
+            await enqueue_speech(gid, target_vc.id, text, short=True)
             return
 
 # =====================
-# チャット反応 → 常駐VCで喋る（常駐が無ければ送信者VC）
+# チャット反応（VCチャットでも“全文”読み上げ）
+# - message.channel が Thread でも拾う（権限があれば）
 # =====================
 @bot.event
 async def on_ready():
@@ -405,40 +407,46 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
+    # DEBUG: VCチャットが拾えてるか確認
+    if DEBUG_LOG:
+        ch_name = getattr(message.channel, "name", str(message.channel))
+        print("GOT:", ch_name, "|", type(message.channel).__name__, "|", repr(message.content))
+
     if not has_call(message.content):
         return
 
     body = strip_call(message.content)
     call_name = make_call_name(message.author)
 
+    gid = message.guild.id
+
+    # 「おばちゃん」だけ
     if body == "":
         reply = f"{call_name}、どしたん？\n無理せんでええ。\n呼べた時点で偉い。\n今いちばんしんどいのどれ？"
         await safe_respond(message, reply)
 
-        # 喋る先：常駐VCがあればそこ、無ければ送信者VC
-        gid = message.guild.id
+        # 読み上げ先：常駐VCがあればそこ。なければ送信者VC
         vc_id = STAY_VC.get(gid)
         if not vc_id:
             if isinstance(message.author, discord.Member) and message.author.voice and message.author.voice.channel:
                 vc_id = message.author.voice.channel.id
+
         if vc_id:
-            await enqueue_speech(gid, vc_id, reply)
+            await enqueue_speech(gid, vc_id, reply, short=False)  # ←全文読み上げ
         return
 
     category = detect_category(body)
     reply = make_reply(category, call_name)
     await safe_respond(message, reply)
 
-    gid = message.guild.id
-
-    # 喋る先：常駐VCがあればそこ、無ければ送信者VC
+    # 読み上げ先：常駐VCがあればそこ。なければ送信者VC
     vc_id = STAY_VC.get(gid)
     if not vc_id:
         if isinstance(message.author, discord.Member) and message.author.voice and message.author.voice.channel:
             vc_id = message.author.voice.channel.id
 
     if vc_id:
-        await enqueue_speech(gid, vc_id, reply)
+        await enqueue_speech(gid, vc_id, reply, short=False)  # ←VCチャットでも全文読み上げ
     else:
         await safe_respond(message, "VC入ってへんやん？ 先に入ってから呼んでな。")
 
