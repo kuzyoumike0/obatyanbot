@@ -6,7 +6,6 @@ import asyncio
 import shutil
 import subprocess
 import discord
-
 from discord.ext import commands
 
 # =====================
@@ -26,7 +25,6 @@ try:
 except Exception as e:
     print("[diag] opus load failed:", e)
 print("==================")
-
 
 # =====================
 # ENV
@@ -58,9 +56,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =====================
 # 状態管理
 # =====================
-STAY_VC: dict[int, int] = {}                 # guild_id -> voice_channel_id
-AUDIO_Q: dict[int, asyncio.Queue] = {}       # guild_id -> queue
-AUDIO_TASK: dict[int, asyncio.Task] = {}     # guild_id -> worker task
+STAY_VC: dict[int, int] = {}
+AUDIO_Q: dict[int, asyncio.Queue] = {}
+AUDIO_TASK: dict[int, asyncio.Task] = {}
 
 LAST_VC_EVENT_AT: dict[tuple[int, int], float] = {}
 LAST_VC_TEXT_AT: dict[tuple[int, int], float] = {}
@@ -84,7 +82,6 @@ def is_call(text: str) -> bool:
 def strip_call(text: str) -> str:
     t = text.strip()
     return t[len("おばちゃん"):].strip() if t.startswith("おばちゃん") else t
-
 
 # =====================
 # おばちゃん文
@@ -186,16 +183,14 @@ async def audio_worker(guild_id: int):
                 await play_audio_file(vc, payload)
 
             elif kind == "tts_short":
-                text = kansai_short(payload)
                 tmp = f"tts_{uuid.uuid4().hex}.mp3"
-                await tts_to_mp3(text, tmp)
+                await tts_to_mp3(kansai_short(payload), tmp)
                 await play_audio_file(vc, tmp)
                 os.remove(tmp)
 
             elif kind == "tts_full":
-                text = kansai_full(payload)
                 tmp = f"tts_{uuid.uuid4().hex}.mp3"
-                await tts_to_mp3(text, tmp)
+                await tts_to_mp3(kansai_full(payload), tmp)
                 await play_audio_file(vc, tmp)
                 os.remove(tmp)
 
@@ -262,7 +257,7 @@ async def on_voice_state_update(member, before, after):
         await enqueue_audio(gid, stay_vc_id, "tts_short", f"{name}おつかれ")
 
 # =====================
-# メッセージ処理（VCテキスト含む）
+# メッセージ処理
 # =====================
 @bot.event
 async def on_message(msg: discord.Message):
@@ -271,9 +266,27 @@ async def on_message(msg: discord.Message):
 
     await bot.process_commands(msg)
 
-    # VCテキスト読み上げ
+    # ===== VCテキスト =====
     if msg.guild and msg.channel.type == discord.ChannelType.voice:
-        key = (msg.guild.id, msg.author.id)
+        gid = msg.guild.id
+
+        # おばちゃん呼びを最優先
+        if is_call(msg.content):
+            name = make_name(msg.author)
+            body = strip_call(msg.content)
+
+            if body == "":
+                reply = f"{name}、どしたん？\n無理せんでええ。\n呼べた時点で偉い。\n今いちばんしんどいのどれ？"
+            else:
+                reply = make_reply(name)
+
+            await msg.channel.send(reply)
+            vc_id = STAY_VC.get(gid) or msg.channel.id
+            await enqueue_audio(gid, vc_id, "tts_full", reply)
+            return
+
+        # 通常VCテキスト読み上げ
+        key = (gid, msg.author.id)
         if now_mono() - LAST_VC_TEXT_AT.get(key, 0) < VC_TEXT_COOLDOWN_SEC:
             return
         LAST_VC_TEXT_AT[key] = now_mono()
@@ -282,11 +295,11 @@ async def on_message(msg: discord.Message):
         if content and not content.startswith("!"):
             content = re.sub(r"https?://\S+", "URL", content)
             name = make_name(msg.author)
-            vc_id = STAY_VC.get(msg.guild.id, msg.channel.id)
-            await enqueue_audio(msg.guild.id, vc_id, "tts_short", f"{name}、{content}")
+            vc_id = STAY_VC.get(gid) or msg.channel.id
+            await enqueue_audio(gid, vc_id, "tts_short", f"{name}、{content}")
         return
 
-    # 通常チャット：おばちゃん呼び
+    # ===== 通常テキスト =====
     if not is_call(msg.content):
         return
 
