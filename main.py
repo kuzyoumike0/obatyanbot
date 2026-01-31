@@ -3,20 +3,26 @@ import re
 import uuid
 import random
 import asyncio
-import discord
 import shutil
+import subprocess
 import discord
+from discord.ext import commands
 
+# =====================
+# 起動時診断（超重要）
+# =====================
 def boot_diagnostics():
-    print("[diag] ffmpeg:", shutil.which("ffmpeg"))
+    print("=== BOOT DIAGNOSTICS ===")
+
+    # ffmpeg
+    print("[diag] ffmpeg path:", shutil.which("ffmpeg"))
     try:
-        import subprocess
-        v = subprocess.check_output(["ffmpeg", "-version"]).decode("utf-8").splitlines()[0]
+        v = subprocess.check_output(["ffmpeg", "-version"]).decode().splitlines()[0]
         print("[diag]", v)
     except Exception as e:
         print("[diag] ffmpeg check failed:", e)
 
-    # opus確認（無音原因の特効薬）
+    # opus
     try:
         if not discord.opus.is_loaded():
             discord.opus.load_opus("libopus.so.0")
@@ -24,456 +30,247 @@ def boot_diagnostics():
     except Exception as e:
         print("[diag] opus load failed:", e)
 
+    print("========================")
+
 boot_diagnostics()
-
-from discord.ext import commands
-
 
 # =====================
 # ENV
 # =====================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DEBUG_LOG = os.getenv("DEBUG_LOG", "0") == "1"
+DEBUG_LOG = os.getenv("DEBUG_LOG", "1") == "1"
 
-# 関西おばちゃん寄り（環境変数で調整）
+# 関西おばちゃん声（調整可）
 TTS_VOICE  = os.getenv("TTS_VOICE", "ja-JP-NanamiNeural")
 TTS_RATE   = os.getenv("TTS_RATE", "+15%")
 TTS_PITCH  = os.getenv("TTS_PITCH", "+2Hz")
 TTS_VOLUME = os.getenv("TTS_VOLUME", "+10%")
 
-# 入退室しゃべりのクールダウン（秒）
 VC_EVENT_COOLDOWN_SEC = int(os.getenv("VC_EVENT_COOLDOWN_SEC", "10"))
 
 # =====================
 # Intents
 # =====================
 intents = discord.Intents.default()
-intents.message_content = True  # DevPortalでON必須
+intents.message_content = True
 intents.guilds = True
-intents.members = True          # ニック安定（DevPortalでON推奨）
-intents.voice_states = True     # 入退室検知に必須
+intents.members = True
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =====================
-# 状態管理（ギルドごと）
+# 状態管理
 # =====================
-STAY_VC: dict[int, int] = {}  # guild_id -> voice_channel_id
-SPEAK_Q: dict[int, asyncio.Queue] = {}
-SPEAK_TASK: dict[int, asyncio.Task] = {}
-LAST_VC_EVENT_AT: dict[tuple[int, int], float] = {}  # (guild_id, user_id) -> monotonic
+STAY_VC = {}          # guild_id -> vc_id
+SPEAK_Q = {}          # guild_id -> asyncio.Queue
+SPEAK_TASK = {}       # guild_id -> task
+LAST_VC_EVENT_AT = {} # (guild_id, user_id) -> time
 
 # =====================
 # ユーティリティ
 # =====================
-def now_mono() -> float:
+def now_mono():
     return asyncio.get_event_loop().time()
 
-def make_call_name(author: discord.abc.User) -> str:
-    name = getattr(author, "display_name", None) or getattr(author, "name", "あんた")
+def make_call_name(user):
+    name = getattr(user, "display_name", None) or getattr(user, "name", "あんた")
     name = re.sub(r"\s+", " ", name).strip()
     if len(name) > 10:
         name = name[:10]
-    if not re.search(r"[A-Za-z0-9ぁ-んァ-ン一-龥]", name):
-        name = "あんた"
-    suffix = random.choice(["ちゃん", "さん", ""])
-    return f"{name}{suffix}"
+    return name + random.choice(["ちゃん", "さん", ""])
 
 def has_call(text: str) -> bool:
     return text.strip().startswith("おばちゃん")
 
 def strip_call(text: str) -> str:
-    t = text.strip()
-    return t[len("おばちゃん"):].strip() if t.startswith("おばちゃん") else t
+    return text.strip()[4:].strip() if text.strip().startswith("おばちゃん") else text
 
-async def safe_respond(message: discord.Message, text: str):
+async def safe_send(ch, text):
     try:
-        await message.reply(text, mention_author=False)
-        return
-    except Exception:
-        pass
-    try:
-        await message.channel.send(text)
+        await ch.send(text)
     except Exception as e:
         print("[send failed]", e)
 
 # =====================
-# おばちゃん文章（チャット返信は4行固定）
+# おばちゃん文生成
 # =====================
-TAILS = ["やで", "やん", "しよか", "せやな", "ほな", "大丈夫や"]
-PAUSES = ["…", ""]
-EMOJIS = ["", "🙂"]
+TAILS = ["やで", "やん", "ほな", "せやな", "大丈夫や"]
 
-CALL_PREFIX = [
-    "{name}、",
-    "{name}な、",
-    "{name}、ちょい聞きぃ、",
-    "{name}、こっちおいで、",
-]
-
-EMPATHY = ["それはしんどかったな", "よう言うてくれたな", "大変やったんやな"]
-TSUKKOMI = ["無理しすぎやで", "抱え込みすぎやん", "根性論では乗り切れん話や"]
-BASE_PRAISE = [
-    "でもここに書けてるのは偉い",
-    "今日も生きてるのは立派や",
-    "呼びかけられた時点で基盤は残ってる",
-]
-SUGGEST = ["今は深呼吸だけでええで", "水かご飯、どっちか入れよ", "今日は最低限で済ませよ"]
-
-CATEGORY_ADDON = {
-    "work_tired": "仕事で削られてるやん、今日は最低限でええ",
-    "work": "仕事は全部背負わんでええ",
-    "tired": "今日は休む日やと思ってええ",
-    "love": "それ、気持ちがちゃんと動いてる証拠や",
-    "life": "生活回してるだけで十分や",
-}
-
-SENSITIVE_REPLY = [
-    [
-        "…それ、相当しんどかったんやな",
-        "ここで話してくれてありがとう",
-        "一人で抱えんでええで",
-        "今、安全な場所におる？",
-    ],
-]
-
-def detect_category(text: str) -> str:
-    t = text
-    if any(k in t for k in ["死にたい", "消えたい", "自殺", "自傷", "切りたい"]):
-        return "sensitive"
-
-    is_work = any(k in t for k in ["仕事", "会社", "上司", "残業", "会議", "納期"])
-    is_tired = any(k in t for k in ["疲れ", "しんど", "無理", "限界", "眠", "だる", "つらい"])
-    if is_work and is_tired:
-        return "work_tired"
-
-    if any(k in t for k in ["好き", "恋", "彼氏", "彼女", "既読", "未読", "告白"]):
-        return "love"
-    if is_work:
-        return "work"
-    if is_tired:
-        return "tired"
-    if any(k in t for k in ["家事", "生活", "掃除", "洗濯", "ご飯", "風呂", "片付け"]):
-        return "life"
-    return "general"
-
-def make_reply(category: str, call_name: str) -> str:
-    if category == "sensitive":
-        lines = random.choice(SENSITIVE_REPLY).copy()
-        if random.random() < 0.25:
-            lines[0] = random.choice(CALL_PREFIX).format(name=call_name) + lines[0]
-        return "\n".join(lines)
-
-    tail = random.choice(TAILS)
-    pause = random.choice(PAUSES)
-    emoji = random.choice(EMOJIS)
-
-    line1 = random.choice(EMPATHY) + pause + tail
-    line2 = (CATEGORY_ADDON.get(category) or random.choice(TSUKKOMI)) + tail
-    line3 = random.choice(BASE_PRAISE) + tail
-    line4 = random.choice(SUGGEST) + tail + emoji
-
-    if random.random() < 0.60:
-        prefix = random.choice(CALL_PREFIX).format(name=call_name)
-        if random.random() < 0.70:
-            line1 = prefix + line1
-        else:
-            line2 = prefix + line2
-
-    return "\n".join([line1, line2, line3, line4])
+def make_reply(name):
+    return "\n".join([
+        f"{name}、それはしんどかったな{random.choice(TAILS)}",
+        f"無理しすぎやで、ほんま",
+        f"でも今日もここ来れてるのは偉い",
+        f"今は深呼吸だけでええ{random.choice(TAILS)}"
+    ])
 
 # =====================
-# 短文だけ「語尾の揺れ」を強める
+# TTS
 # =====================
-SHORT_TAILS = [
-    "やで", "やんな", "ほなな", "せやで", "せやんな",
-    "ええやん", "かまへん", "無理すなや",
-]
+SHORT_TAILS = ["やで", "やんな", "ほなな", "せやで", "かまへん"]
 
-def add_short_tail(text: str) -> str:
-    """
-    入退室の一言だけ語尾を強める（うるさくしない範囲で）
-    """
-    t = text.strip()
-    # すでに語尾っぽいのがあるならそのまま
-    if any(t.endswith(x) for x in ["やで", "やんな", "ほなな", "せやで", "せやんな", "ええやん", "かまへん"]):
-        return t
-    # たまに語尾なしも混ぜて“くどさ”を減らす
-    if random.random() < 0.20:
-        return t
-    return f"{t}{random.choice(SHORT_TAILS)}"
+def kansai_short(text):
+    if random.random() < 0.8:
+        text += random.choice(SHORT_TAILS)
+    return text + "。"
 
-# =====================
-# TTS（edge-tts）整形
-# =====================
-def to_kansai_speak(text: str, short: bool) -> str:
-    """
-    short=True: 一言用（語尾強め＋短く）
-    short=False: 4行全文用（チャット/VCチャットはこれ）
-    """
-    if short:
-        t = add_short_tail(text)
-        t = t.replace("、", "、 ").replace("。", "。 ")
-        if len(t) > 70:
-            t = t[:70] + "…"
-        return t + "。"
+def kansai_full(text):
+    lines = text.split("\n")
+    return "… ".join(lines) + "。"
 
-    lines = [l.strip() for l in text.split("\n") if l.strip()][:4]
-    cooked = []
-    for ln in lines:
-        ln = ln.replace("やで🙂", "やで。🙂")
-        if "やで" in ln and "やで、" not in ln:
-            ln = ln.replace("やで", "やで、")
-        if "やん" in ln and "やん、" not in ln:
-            ln = ln.replace("やん", "やん、")
-        cooked.append(ln)
-
-    speak = "… ".join(cooked) + "。"
-    if len(speak) > 260:
-        speak = speak[:260] + "…"
-    return speak
-
-async def tts_to_mp3(text: str, out_path: str):
+async def tts_to_mp3(text, path):
     import edge_tts
-    communicate = edge_tts.Communicate(
+    comm = edge_tts.Communicate(
         text=text,
         voice=TTS_VOICE,
         rate=TTS_RATE,
         pitch=TTS_PITCH,
         volume=TTS_VOLUME,
     )
-    await communicate.save(out_path)
+    await comm.save(path)
 
-async def ensure_queue(guild_id: int) -> asyncio.Queue:
-    q = SPEAK_Q.get(guild_id)
-    if q is None:
-        q = asyncio.Queue()
-        SPEAK_Q[guild_id] = q
-    return q
-
-async def get_or_connect_vc(guild: discord.Guild, channel: discord.VoiceChannel) -> discord.VoiceClient:
+async def get_vc(guild, channel):
     vc = discord.utils.get(bot.voice_clients, guild=guild)
     if vc and vc.is_connected():
-        if vc.channel and vc.channel.id != channel.id:
+        if vc.channel.id != channel.id:
             await vc.move_to(channel)
         return vc
-    return await channel.connect(timeout=10)
+    return await channel.connect()
 
-async def play_mp3(vc: discord.VoiceClient, mp3_path: str):
+async def play_mp3(vc, path):
+    print("[diag] play file exists:", os.path.exists(path))
     done = asyncio.Event()
 
-    def after_play(err):
+    def after(err):
         if err:
             print("[VC play error]", err)
         done.set()
 
-    src = discord.FFmpegPCMAudio(mp3_path)
-    vc.play(src, after=after_play)
+    vc.play(discord.FFmpegPCMAudio(path), after=after)
     await done.wait()
 
-async def speaker_worker(guild_id: int):
-    q = await ensure_queue(guild_id)
+async def speaker_worker(guild_id):
+    q = SPEAK_Q[guild_id]
     while True:
         item = await q.get()
         if item is None:
-            q.task_done()
             return
 
-        voice_channel_id, raw_text, short = item
+        vc_id, text, short = item
+        guild = bot.get_guild(guild_id)
+        vc_ch = guild.get_channel(vc_id)
+
         try:
-            guild = bot.get_guild(guild_id)
-            if guild is None:
-                q.task_done()
-                continue
-
-            ch = guild.get_channel(voice_channel_id)
-            if not isinstance(ch, discord.VoiceChannel):
-                q.task_done()
-                continue
-
-            vc = await get_or_connect_vc(guild, ch)
+            vc = await get_vc(guild, vc_ch)
             tmp = f"tts_{uuid.uuid4().hex}.mp3"
 
-            speak_text = to_kansai_speak(raw_text, short=short)
-            if DEBUG_LOG:
-                print("[TTS]", speak_text)
+            speak = kansai_short(text) if short else kansai_full(text)
+            print("[diag] speaking:", speak)
 
-            await tts_to_mp3(speak_text, tmp)
+            await tts_to_mp3(speak, tmp)
             await play_mp3(vc, tmp)
 
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
+            os.remove(tmp)
 
-            # 常駐先が無ければ退出
-            if STAY_VC.get(guild_id) is None:
-                try:
-                    await vc.disconnect(force=True)
-                except Exception:
-                    pass
+            if guild_id not in STAY_VC:
+                await vc.disconnect()
 
         except Exception as e:
             print("[speaker_worker error]", e)
-        finally:
-            q.task_done()
 
-async def enqueue_speech(guild_id: int, voice_channel_id: int, text: str, short: bool):
-    q = await ensure_queue(guild_id)
-    await q.put((voice_channel_id, text, short))
+        q.task_done()
+
+async def enqueue_speech(guild_id, vc_id, text, short):
+    if guild_id not in SPEAK_Q:
+        SPEAK_Q[guild_id] = asyncio.Queue()
+    await SPEAK_Q[guild_id].put((vc_id, text, short))
+
     if guild_id not in SPEAK_TASK or SPEAK_TASK[guild_id].done():
         SPEAK_TASK[guild_id] = asyncio.create_task(speaker_worker(guild_id))
 
 # =====================
 # VC常駐コマンド
 # =====================
-@bot.command(name="join")
-async def join_cmd(ctx: commands.Context):
-    if not isinstance(ctx.author, discord.Member):
+@bot.command()
+async def join(ctx):
+    if not ctx.author.voice:
+        await ctx.send("先にVC入ってな。")
         return
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        await ctx.send("先にVC入ってから呼んでな。")
-        return
-    vc_ch = ctx.author.voice.channel
-    STAY_VC[ctx.guild.id] = vc_ch.id
-    await ctx.send(f"ほな、ここ常駐するわ：{vc_ch.name}")
-    try:
-        await get_or_connect_vc(ctx.guild, vc_ch)
-    except Exception as e:
-        await ctx.send(f"入れんかった…権限（Connect/Speak）ある？ {e}")
+    vc = ctx.author.voice.channel
+    STAY_VC[ctx.guild.id] = vc.id
+    await ctx.send(f"{vc.name} に常駐するで。")
+    await get_vc(ctx.guild, vc)
 
-@bot.command(name="leave")
-async def leave_cmd(ctx: commands.Context):
-    gid = ctx.guild.id
-    STAY_VC.pop(gid, None)
+@bot.command()
+async def leave(ctx):
+    STAY_VC.pop(ctx.guild.id, None)
     vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
-    if vc and vc.is_connected():
-        try:
-            await vc.disconnect(force=True)
-        except Exception:
-            pass
-    await ctx.send("ほな、また呼んでな。")
+    if vc:
+        await vc.disconnect()
+    await ctx.send("ほな、またな。")
 
 # =====================
-# 入退室：短く一言だけ（語尾強め）
+# 入退室（一言）
 # =====================
-JOIN_ONE = [
-    "{name}来たん？ えらい",
-    "{name}おかえり",
-    "{name}無理せんと",
-]
-LEAVE_ONE = [
-    "{name}おつかれ",
-    "{name}またな",
-    "{name}休みや",
-]
-MOVE_ONE = [
-    "{name}移動おつ",
-    "{name}そっちやな",
-]
-
 @bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+async def on_voice_state_update(member, before, after):
     if member.bot:
         return
-    guild = member.guild
-    gid = guild.id
 
-    stay_id = STAY_VC.get(gid)
-    if not stay_id:
+    gid = member.guild.id
+    vc_id = STAY_VC.get(gid)
+    if not vc_id:
         return
 
-    target_vc = guild.get_channel(stay_id)
-    if not isinstance(target_vc, discord.VoiceChannel):
-        return
-
-    # クールダウン（同一人物の連打抑制）
+    now = now_mono()
     key = (gid, member.id)
-    last = LAST_VC_EVENT_AT.get(key, 0.0)
-    if now_mono() - last < VC_EVENT_COOLDOWN_SEC:
+    if now - LAST_VC_EVENT_AT.get(key, 0) < VC_EVENT_COOLDOWN_SEC:
         return
-    LAST_VC_EVENT_AT[key] = now_mono()
+    LAST_VC_EVENT_AT[key] = now
 
     name = make_call_name(member)
 
-    # 参加（target VCに入ったときだけ）
-    if before.channel is None and after.channel and after.channel.id == target_vc.id:
-        text = random.choice(JOIN_ONE).format(name=name)
-        await enqueue_speech(gid, target_vc.id, text, short=True)
-        return
+    if before.channel is None and after.channel and after.channel.id == vc_id:
+        await enqueue_speech(gid, vc_id, f"{name}来たん？", True)
 
-    # 退出（target VCから抜けたときだけ）
-    if before.channel and before.channel.id == target_vc.id and after.channel is None:
-        text = random.choice(LEAVE_ONE).format(name=name)
-        await enqueue_speech(gid, target_vc.id, text, short=True)
-        return
-
-    # 移動（target VCに出入りが絡む時だけ）
-    if before.channel and after.channel and before.channel.id != after.channel.id:
-        if before.channel.id == target_vc.id or after.channel.id == target_vc.id:
-            text = random.choice(MOVE_ONE).format(name=name)
-            await enqueue_speech(gid, target_vc.id, text, short=True)
-            return
+    if before.channel and before.channel.id == vc_id and after.channel is None:
+        await enqueue_speech(gid, vc_id, f"{name}おつかれ", True)
 
 # =====================
-# チャット反応（VCチャットでも“全文”読み上げ）
-# - message.channel が Thread でも拾う（権限があれば）
+# チャット反応（VCチャット含む）
 # =====================
 @bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (id={bot.user.id})")
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
+async def on_message(msg):
+    if msg.author.bot:
         return
 
-    await bot.process_commands(message)
+    await bot.process_commands(msg)
 
-    # DEBUG: VCチャットが拾えてるか確認
     if DEBUG_LOG:
-        ch_name = getattr(message.channel, "name", str(message.channel))
-        print("GOT:", ch_name, "|", type(message.channel).__name__, "|", repr(message.content))
+        print("[GOT]", type(msg.channel).__name__, msg.content)
 
-    if not has_call(message.content):
+    if not has_call(msg.content):
         return
 
-    body = strip_call(message.content)
-    call_name = make_call_name(message.author)
+    name = make_call_name(msg.author)
+    reply = make_reply(name)
 
-    gid = message.guild.id
+    await safe_send(msg.channel, reply)
 
-    # 「おばちゃん」だけ
-    if body == "":
-        reply = f"{call_name}、どしたん？\n無理せんでええ。\n呼べた時点で偉い。\n今いちばんしんどいのどれ？"
-        await safe_respond(message, reply)
-
-        # 読み上げ先：常駐VCがあればそこ。なければ送信者VC
-        vc_id = STAY_VC.get(gid)
-        if not vc_id:
-            if isinstance(message.author, discord.Member) and message.author.voice and message.author.voice.channel:
-                vc_id = message.author.voice.channel.id
-
-        if vc_id:
-            await enqueue_speech(gid, vc_id, reply, short=False)  # ←全文読み上げ
-        return
-
-    category = detect_category(body)
-    reply = make_reply(category, call_name)
-    await safe_respond(message, reply)
-
-    # 読み上げ先：常駐VCがあればそこ。なければ送信者VC
+    gid = msg.guild.id
     vc_id = STAY_VC.get(gid)
-    if not vc_id:
-        if isinstance(message.author, discord.Member) and message.author.voice and message.author.voice.channel:
-            vc_id = message.author.voice.channel.id
+
+    if not vc_id and msg.author.voice:
+        vc_id = msg.author.voice.channel.id
 
     if vc_id:
-        await enqueue_speech(gid, vc_id, reply, short=False)  # ←VCチャットでも全文読み上げ
-    else:
-        await safe_respond(message, "VC入ってへんやん？ 先に入ってから呼んでな。")
+        await enqueue_speech(gid, vc_id, reply, False)
 
+# =====================
+# 起動
+# =====================
 if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing")
+    raise RuntimeError("DISCORD_TOKEN missing")
 
 bot.run(DISCORD_TOKEN)
