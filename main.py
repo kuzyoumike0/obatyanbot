@@ -42,6 +42,11 @@ JOIN_SE_PATH = os.getenv("JOIN_SE_PATH", "nyuusitu.mp3")
 VC_EVENT_COOLDOWN_SEC = int(os.getenv("VC_EVENT_COOLDOWN_SEC", "10"))
 VC_TEXT_COOLDOWN_SEC  = int(os.getenv("VC_TEXT_COOLDOWN_SEC", "2"))
 
+# 人格ブレ（0〜100）
+OBACHAN_SASS = int(os.getenv("OBACHAN_SASS", "55"))   # 小言/ツッコミ強さ
+OBACHAN_SOFT = int(os.getenv("OBACHAN_SOFT", "75"))   # 優しさ/肯定強さ
+OBACHAN_LONG = int(os.getenv("OBACHAN_LONG", "55"))   # 長文率（高いほど4行+α）
+
 # =====================
 # Intents
 # =====================
@@ -83,18 +88,88 @@ def strip_call(text: str) -> str:
     t = text.strip()
     return t[len("おばちゃん"):].strip() if t.startswith("おばちゃん") else t
 
-# =====================
-# おばちゃん文
-# =====================
-TAILS = ["やで", "やん", "ほな", "せやな", "大丈夫や"]
+def chance(pct: int) -> bool:
+    return random.randint(1, 100) <= max(0, min(100, pct))
 
-def make_reply(name: str) -> str:
-    return "\n".join([
+# =====================
+# おばちゃん人格（台詞パーツ）
+# =====================
+TAILS = ["やで", "やん", "ほな", "せやな", "大丈夫や", "まあな"]
+LAUGHT = ["（笑）", "w", "ふふ", "ほんまにもう"]
+CANDY = ["飴ちゃんいる？", "あったかいお茶飲み。", "とりあえず水や。", "背中さすったろか。"]
+SCOLD = [
+    "無理しすぎやって。ほんま。",
+    "頑張り屋ほど倒れるんやで。",
+    "抱え込み癖、出てるで。",
+    "それ、気ぃ張りすぎや。"
+]
+PRAISE = [
+    "今日ここまで来ただけで偉い。",
+    "呼べた時点で勝ちやで。",
+    "しんどいって言えたん、えらい。",
+    "逃げへんかった自分、ようやった。"
+]
+ASK = [
+    "いま一番しんどいの、どれ？",
+    "体と心、どっちが先に悲鳴あげてる？",
+    "0〜10で言うたら、しんどさ何点？",
+    "寝れてる？ご飯は？"
+]
+TIP = [
+    "今日は“深呼吸3回”だけやって、あとは甘やかし。",
+    "1個だけやるなら、顔洗うか布団入るかや。",
+    "今の自分を責めるの禁止。代わりに肩回して。",
+    "まず温度上げよ。寒いとメンタル縮むんよ。"
+]
+TEASE = [
+    "あんたほんま、頑張りすぎ選手権優勝やな。",
+    "また1人で背負ってる顔しとるで。",
+    "それ、我慢大会ちゃうねん。",
+    "ええ子ぶりすぎや、息して。"
+]
+
+def make_obachan_reply(name: str, body: str) -> str:
+    """
+    返事は「共感→小言(任意)→肯定→提案→質問」っぽい人格にする
+    body は参考にするが、重い判定とかはしない（安全に雑談寄り）
+    """
+    # 共感（先頭）
+    empath = random.choice([
         f"{name}、それはしんどかったな{random.choice(TAILS)}",
-        "無理しすぎやで",
-        "でも今日も生きてるのは偉い",
-        f"今は深呼吸だけでええ{random.choice(TAILS)}"
+        f"{name}、よう言うてくれたな{random.choice(TAILS)}",
+        f"{name}、今はつらい時やな{random.choice(TAILS)}",
     ])
+
+    # 小言/ツッコミ（性格：SASS）
+    sc = ""
+    if chance(OBACHAN_SASS):
+        sc = random.choice(TEASE if chance(50) else SCOLD)
+
+    # 肯定（性格：SOFT）
+    pr = random.choice(PRAISE) if chance(OBACHAN_SOFT) else "まあ…しゃあない日もある。"
+
+    # 提案（お世話）
+    tip = random.choice(TIP)
+    candy = random.choice(CANDY)
+
+    # 質問（会話を繋ぐ）
+    ask = random.choice(ASK)
+
+    # 長文化（人格：LONG）
+    lines = [empath]
+    if sc:
+        lines.append(sc + random.choice(["", " " + random.choice(LAUGHT)]))
+    lines.append(pr)
+    lines.append(tip + random.choice(["", f" {candy}"]))
+    lines.append(ask)
+
+    # 4行ベース＋α（長文率で変える）
+    if chance(OBACHAN_LONG):
+        # 5行
+        return "\n".join(lines[:5])
+    else:
+        # 4行（短め）
+        return "\n".join(lines[:4])
 
 # =====================
 # TTS
@@ -186,13 +261,19 @@ async def audio_worker(guild_id: int):
                 tmp = f"tts_{uuid.uuid4().hex}.mp3"
                 await tts_to_mp3(kansai_short(payload), tmp)
                 await play_audio_file(vc, tmp)
-                os.remove(tmp)
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
 
             elif kind == "tts_full":
                 tmp = f"tts_{uuid.uuid4().hex}.mp3"
                 await tts_to_mp3(kansai_full(payload), tmp)
                 await play_audio_file(vc, tmp)
-                os.remove(tmp)
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
 
         except Exception as e:
             print("[audio_worker error]", e)
@@ -270,22 +351,27 @@ async def on_message(msg: discord.Message):
     if msg.guild and msg.channel.type == discord.ChannelType.voice:
         gid = msg.guild.id
 
-        # おばちゃん呼びを最優先
+        # おばちゃん呼びを最優先（返事＋全文読み上げ）
         if is_call(msg.content):
             name = make_name(msg.author)
             body = strip_call(msg.content)
+            reply = make_obachan_reply(name, body) if body else (
+                f"{name}、どしたん？\n"
+                "無理せんでええ。\n"
+                "呼べた時点で偉い。\n"
+                f"{random.choice(ASK)}"
+            )
 
-            if body == "":
-                reply = f"{name}、どしたん？\n無理せんでええ。\n呼べた時点で偉い。\n今いちばんしんどいのどれ？"
-            else:
-                reply = make_reply(name)
+            try:
+                await msg.channel.send(reply)
+            except Exception as e:
+                print("[send reply failed]", e)
 
-            await msg.channel.send(reply)
             vc_id = STAY_VC.get(gid) or msg.channel.id
             await enqueue_audio(gid, vc_id, "tts_full", reply)
             return
 
-        # 通常VCテキスト読み上げ
+        # 通常VCテキスト読み上げ（短く）
         key = (gid, msg.author.id)
         if now_mono() - LAST_VC_TEXT_AT.get(key, 0) < VC_TEXT_COOLDOWN_SEC:
             return
@@ -293,7 +379,12 @@ async def on_message(msg: discord.Message):
 
         content = msg.content.strip()
         if content and not content.startswith("!"):
+            # 読み上げ邪魔なものは丸める
+            content = re.sub(r"\s+", " ", content)
+            content = re.sub(r"<@!?\d+>", "メンション", content)
+            content = re.sub(r"<#\d+>", "チャンネル", content)
             content = re.sub(r"https?://\S+", "URL", content)
+
             name = make_name(msg.author)
             vc_id = STAY_VC.get(gid) or msg.channel.id
             await enqueue_audio(gid, vc_id, "tts_short", f"{name}、{content}")
@@ -305,11 +396,28 @@ async def on_message(msg: discord.Message):
 
     name = make_name(msg.author)
     body = strip_call(msg.content)
-    reply = make_reply(name) if body else f"{name}、どしたん？\n無理せんでええ。"
 
-    await msg.channel.send(reply)
+    if body == "":
+        reply = (
+            f"{name}、どしたん？\n"
+            "無理せんでええ。\n"
+            "呼べた時点で偉い。\n"
+            f"{random.choice(ASK)}"
+        )
+    else:
+        reply = make_obachan_reply(name, body)
 
+    try:
+        await msg.channel.send(reply)
+    except Exception as e:
+        print("[send reply failed]", e)
+
+    # 読み上げ先：常駐VCがあればそこ、なければ送信者のVC（いれば）
     vc_id = STAY_VC.get(msg.guild.id)
+
+    if not vc_id and isinstance(msg.author, discord.Member) and msg.author.voice and msg.author.voice.channel:
+        vc_id = msg.author.voice.channel.id
+
     if vc_id:
         await enqueue_audio(msg.guild.id, vc_id, "tts_full", reply)
 
