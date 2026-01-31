@@ -15,25 +15,83 @@ except Exception:
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# モデルは必要に応じて変更OK
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
 intents = discord.Intents.default()
-intents.message_content = True  # Discord開発者ポータルでも Message Content Intent をONにする
+intents.message_content = True  # Discord Developer Portalでも Message Content Intent をON
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =====================
-# おばちゃん人格
+# 返答トリガー：チャット内に「おばちゃん○○」がある時だけ
+# 例）おばちゃん相談 / おばちゃん聞いて / おばちゃん恋バナ
+# =====================
+CALL_PATTERN = re.compile(r"(おばちゃん)(\S+)")
+
+def has_call(text: str) -> bool:
+    return bool(CALL_PATTERN.search(text))
+
+def strip_call(text: str) -> str:
+    # 最初に見つかった「おばちゃん○○」だけ消して本文を優先
+    return CALL_PATTERN.sub("", text, count=1).strip()
+
+def normalize(text: str) -> str:
+    return re.sub(r"\s+", "", text.lower())
+
+# =====================
+# センシティブ判定（やさしく誘導）
+# =====================
+SENSITIVE_KEYWORDS = [
+    # 希死念慮・自傷
+    "死にたい", "消えたい", "自殺", "自傷", "切りたい", "終わりたい", "楽になりたい",
+    # 極端な絶望・孤立
+    "もう無理", "限界", "誰もいない", "ひとりぼっち", "助けて", "耐えられない",
+    # 暴力・支配・DV
+    "殴られ", "蹴られ", "暴力", "dv", "監視", "支配", "脅され", "怒鳴られ",
+    # 強い怒り（他害・暴走）
+    "殺す", "ぶっ殺す", "許さない", "ぶち壊す",
+]
+
+def is_sensitive(text: str) -> bool:
+    t = normalize(text)
+    return any(k in t for k in SENSITIVE_KEYWORDS)
+
+SENSITIVE_FALLBACK = [
+    "…それ、相当しんどかったんやな。\nここで話してくれてありがとう。\n一人で抱えんでええで、まず呼吸しよ。\n今、安全な場所におる？",
+    "そんな気持ちになるほど追い込まれてたんやね。\n否定せぇへん、あんたのせいって決めつけん。\n今日は休む準備だけでええ。\n近くの信頼できる人に繋がれそう？",
+]
+
+SENSITIVE_SYSTEM_APPEND = """
+【センシティブ対応】
+この相談はセンシティブ（希死念慮/自傷/暴力/DV/強い絶望/他害など）に該当する可能性が高い。
+- 否定・説教・正論は禁止
+- 具体的な手段・方法・成功率などには触れない
+- 共感と安心を最優先
+- 安全確認（今安全か）や休息提案を1つだけ
+- 必要なら「信頼できる人/専門窓口/緊急時は地域の緊急番号」などにやさしく誘導
+- 必ず4行以内
+"""
+
+# =====================
+# おばちゃん人格（4行縛り＋優しさ5:ツッコミ4:正論1）
 # =====================
 AUNT_SYSTEM = """あなたは「知らないのにおせっかいで、でも優しいおばちゃんAI」。
-口調：関西寄り（強すぎない）。距離感近め。
-比率：優しさ5：ツッコミ4：正論1（説教はしない）。
-得意：恋バナ、仕事の疲れケア、日常生活の基盤を見つけて褒める。
-返答構成：
-1) 共感・労い
-2) 軽いツッコミ
-3) 生活基盤ほめ
-4) 小さい提案 or 質問（1つ）
-長さ：必ず4行以内。各行短く。絵文字は最大1個。
+口調：関西寄り（強すぎない）。距離感近め。語尾に「〜やで」「〜やん」「〜しよか」など。
+比率：優しさ5：ツッコミ4：正論1（正論は最小限、説教はしない）。
+得意：恋バナ、仕事の疲れへの労い、日常生活の基盤（起きてる/働いてる/ご飯食べた/風呂入った等）を見つけて褒める。
+スタンス：「知らんけど」は使ってよいが、投げやりにしない。相手の気持ちを先に受け止めてから軽くツッコむ。
+返答の型：
+1) 共感・労い（短く）
+2) ツッコミ（軽く笑える範囲）
+3) 生活基盤ほめ（できてる部分を具体的に）
+4) 小さい提案 or 確認質問（1つだけ）
+長さ：必ず4行以内。各行は短め。絵文字は控えめ（最大1個）。
 禁止：差別・暴力扇動・個人情報の詮索。医療/法律は断定せず専門家案内。
+【センシティブ対応ルール】
+もし希死念慮/自傷/強い絶望/DV/暴力/他害/パニック等が含まれる場合は、
+否定や説教をせず、具体的な方法には触れず、安心と安全確認を優先し、必要なら相談先へやさしく誘導する。
+必ず4行以内。
 """
 
 CATEGORY_GUIDE = {
@@ -67,35 +125,21 @@ AUNT_FALLBACK_BY_CATEGORY = {
 }
 
 # =====================
-# 呼びかけトリガー
-# 「おばちゃん○○」が含まれる時だけ反応
+# カテゴリ判定：恋愛 > 仕事疲れ(複合) > 仕事 > 疲れ > 生活 > その他
 # =====================
-CALL_PATTERN = re.compile(r"(おばちゃん)(\S+)")
-
-def has_call(text: str) -> bool:
-    return bool(CALL_PATTERN.search(text))
-
-def strip_call(text: str) -> str:
-    # 最初に見つかった「おばちゃん○○」だけ消す（本文を優先）
-    return CALL_PATTERN.sub("", text, count=1).strip()
-
-def normalize(text: str) -> str:
-    return re.sub(r"\s+", "", text.lower())
-
 def detect_category(text: str) -> str:
     t = normalize(text)
 
-    love = ["好き", "恋", "彼氏", "彼女", "既読", "未読", "告白", "デート", "脈", "別れ"]
-    work = ["仕事", "会社", "上司", "部下", "同僚", "残業", "会議", "転職", "納期", "クレーム"]
-    tired = ["疲れ", "しんど", "つら", "無理", "限界", "眠", "寝れ", "だる", "ストレス", "不安", "消えたい", "しにたい"]
-    life = ["生活", "家事", "掃除", "洗濯", "料理", "自炊", "ご飯", "風呂", "片付け", "習慣", "貯金", "節約"]
+    love = ["好き", "恋", "彼氏", "彼女", "既読", "未読", "告白", "デート", "脈", "別れ", "付き合"]
+    work = ["仕事", "会社", "上司", "部下", "同僚", "残業", "会議", "転職", "納期", "クレーム", "シフト", "評価", "ブラック"]
+    tired = ["疲れ", "しんど", "つら", "無理", "限界", "眠", "寝れ", "だる", "ストレス", "不安", "メンタル"]
+    life = ["生活", "家事", "掃除", "洗濯", "料理", "自炊", "ご飯", "風呂", "片付け", "習慣", "貯金", "節約", "ルーティン"]
 
     is_love = any(k in t for k in love)
     is_work = any(k in t for k in work)
     is_tired = any(k in t for k in tired)
     is_life = any(k in t for k in life)
 
-    # 優先度：恋愛 > 仕事疲れ(複合) > 仕事 > 疲れ > 生活 > その他
     if is_love:
         return "love"
     if is_work and is_tired:
@@ -109,12 +153,13 @@ def detect_category(text: str) -> str:
     return "general"
 
 def enforce_4_lines(text: str) -> str:
+    # 4行を超えたらカット（空行は除外）
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     return "\n".join(lines[:4]) if lines else text.strip()
 
 # =====================
-# 短期記憶：直近3往復（= 最大6発言）
-# チャンネル単位で保持
+# 短期記憶：直近3往復（最大6発言）
+# チャンネル単位で保持（必要なら user×channel にもできる）
 # =====================
 memory_by_channel = defaultdict(lambda: deque(maxlen=6))
 
@@ -129,6 +174,9 @@ def build_openai_input(ch_id: int, system_text: str, user_text: str):
     msgs.append({"role": "user", "content": user_text})
     return msgs
 
+# =====================
+# Discord events
+# =====================
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})")
@@ -147,35 +195,47 @@ async def on_message(message: discord.Message):
     # 呼びかけ部分を除去して本文を作る
     user_text = strip_call(message.content)
     if not user_text:
-        # 本文が空なら、元メッセージをそのまま使う
         user_text = message.content.strip()
 
+    # センシティブ判定
+    sensitive = is_sensitive(user_text)
+
+    # カテゴリ（センシティブならカテゴリより優先）
     category = detect_category(user_text)
 
-    # まずユーザー発言を記憶
+    # ユーザー発言を短期記憶に追加
     add_memory(message.channel.id, "user", user_text)
 
-    # OpenAIなし or 失敗時の定型返し
+    # OpenAIが使えない時の返答
     if not (OPENAI_API_KEY and OpenAI):
-        out = random.choice(AUNT_FALLBACK_BY_CATEGORY[category])
+        if sensitive:
+            out = random.choice(SENSITIVE_FALLBACK)
+        else:
+            out = random.choice(AUNT_FALLBACK_BY_CATEGORY[category])
         out = enforce_4_lines(out)
         await message.reply(out, mention_author=False)
         add_memory(message.channel.id, "assistant", out)
         return
 
+    # OpenAI 呼び出し
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    # Responses API（新規はこれ推奨）
-    system_text = AUNT_SYSTEM + "\n" + CATEGORY_GUIDE.get(category, CATEGORY_GUIDE["general"]) + "\n出力は必ず4行以内。"
+    # system text 構築（センシティブ優先）
+    system_text = AUNT_SYSTEM + "\n"
+    if sensitive:
+        system_text += SENSITIVE_SYSTEM_APPEND + "\n"
+    else:
+        system_text += CATEGORY_GUIDE.get(category, CATEGORY_GUIDE["general"]) + "\n"
+    system_text += "出力は必ず4行以内。4行を超えそうなら短くまとめる。\n"
 
     try:
         resp = client.responses.create(
-            model="gpt-4.1-mini",
+            model=OPENAI_MODEL,
             input=build_openai_input(message.channel.id, system_text, user_text),
         )
         out = resp.output_text.strip() if hasattr(resp, "output_text") else ""
         if not out:
-            out = random.choice(AUNT_FALLBACK_BY_CATEGORY[category])
+            out = random.choice(SENSITIVE_FALLBACK if sensitive else AUNT_FALLBACK_BY_CATEGORY[category])
 
         out = enforce_4_lines(out)
         await message.reply(out, mention_author=False)
@@ -183,12 +243,12 @@ async def on_message(message: discord.Message):
 
     except Exception as e:
         print("OpenAI error:", e)
-        out = random.choice(AUNT_FALLBACK_BY_CATEGORY[category])
+        out = random.choice(SENSITIVE_FALLBACK if sensitive else AUNT_FALLBACK_BY_CATEGORY[category])
         out = enforce_4_lines(out)
         await message.reply(out, mention_author=False)
         add_memory(message.channel.id, "assistant", out)
 
 if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing")
+    raise RuntimeError("DISCORD_TOKEN is missing. Set it in environment variables.")
 
 bot.run(DISCORD_TOKEN)
