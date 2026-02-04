@@ -42,6 +42,9 @@ JOIN_SE_PATH = os.getenv("JOIN_SE_PATH", "nyuusitu.mp3")
 VC_EVENT_COOLDOWN_SEC = int(os.getenv("VC_EVENT_COOLDOWN_SEC", "10"))
 VC_TEXT_COOLDOWN_SEC  = int(os.getenv("VC_TEXT_COOLDOWN_SEC", "2"))
 
+# 無人切断までの猶予秒
+VC_EMPTY_DISCONNECT_SEC = int(os.getenv("VC_EMPTY_DISCONNECT_SEC", "60"))
+
 # 人格ブレ
 OBACHAN_SASS = int(os.getenv("OBACHAN_SASS", "55"))
 OBACHAN_SOFT = int(os.getenv("OBACHAN_SOFT", "75"))
@@ -61,9 +64,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =====================
 # 状態管理
 # =====================
-STAY_VC: dict[int, int] = {}
-AUDIO_Q: dict[int, asyncio.Queue] = {}
-AUDIO_TASK: dict[int, asyncio.Task] = {}
+STAY_VC: dict[int, int] = {}              # guild_id -> vc_id
+AUDIO_Q: dict[int, asyncio.Queue] = {}    # guild_id -> Queue
+AUDIO_TASK: dict[int, asyncio.Task] = {}  # guild_id -> worker task
+
+EMPTY_TIMER: dict[int, asyncio.Task] = {} # guild_id -> empty disconnect timer
 
 LAST_VC_EVENT_AT: dict[tuple[int, int], float] = {}
 LAST_VC_TEXT_AT: dict[tuple[int, int], float] = {}
@@ -90,6 +95,46 @@ def strip_call(text: str) -> str:
 
 def chance(pct: int) -> bool:
     return random.randint(1, 100) <= max(0, min(100, pct))
+
+def non_bot_count(ch: discord.VoiceChannel) -> int:
+    return sum(1 for m in ch.members if not m.bot)
+
+def cancel_empty_timer(gid: int):
+    t = EMPTY_TIMER.pop(gid, None)
+    if t and not t.done():
+        t.cancel()
+
+async def schedule_empty_disconnect(gid: int, vc_id: int):
+    cancel_empty_timer(gid)
+
+    async def _job():
+        try:
+            await asyncio.sleep(VC_EMPTY_DISCONNECT_SEC)
+            guild = bot.get_guild(gid)
+            if not guild:
+                return
+
+            ch = guild.get_channel(vc_id)
+            if not isinstance(ch, discord.VoiceChannel):
+                return
+
+            if non_bot_count(ch) == 0:
+                vc = discord.utils.get(bot.voice_clients, guild=guild)
+                if vc and vc.is_connected():
+                    if vc.is_playing():
+                        return
+                    try:
+                        await vc.disconnect(force=True)
+                    except Exception:
+                        pass
+
+                # 常駐解除（不要ならこの行を消してOK）
+                STAY_VC.pop(gid, None)
+
+        except asyncio.CancelledError:
+            return
+
+    EMPTY_TIMER[gid] = asyncio.create_task(_job())
 
 # =====================
 # おばちゃん人格
@@ -171,12 +216,11 @@ async def tts_to_mp3(text: str, out_path: str):
     await tts.save(out_path)
 
 # =====================
-# VC 接続（★耐障害版）
+# VC 接続
 # =====================
 async def get_vc(guild: discord.Guild, channel: discord.VoiceChannel) -> discord.VoiceClient:
     vc = discord.utils.get(bot.voice_clients, guild=guild)
 
-    # 壊れたVCは必ず捨てる
     if vc and not vc.is_connected():
         try:
             await vc.disconnect(force=True)
@@ -254,10 +298,9 @@ async def audio_worker(guild_id: int):
 
         finally:
             q.task_done()
-            # ★ アイドル時は切断（安定化の要）
-            if vc and not vc.is_playing() and guild_id not in STAY_VC:
+            if vc and not vc.is_playing() and guild_id not in STAY_VC and q.empty():
                 try:
-                    await vc.disconnect()
+                    await vc.disconnect(force=True)
                 except Exception:
                     pass
 
@@ -279,6 +322,8 @@ async def join(ctx):
 
     vc = ctx.author.voice.channel
     STAY_VC[ctx.guild.id] = vc.id
+    cancel_empty_timer(ctx.guild.id)
+
     await get_vc(ctx.guild, vc)
     await enqueue_audio(ctx.guild.id, vc.id, "file", JOIN_SE_PATH)
     await ctx.send(f"{vc.name} に常駐するで。")
@@ -286,9 +331,12 @@ async def join(ctx):
 @bot.command()
 async def leave(ctx):
     STAY_VC.pop(ctx.guild.id, None)
+    cancel_empty_timer(ctx.guild.id)
+
     vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
     if vc:
         await vc.disconnect(force=True)
+
     await ctx.send("ほな、またな。")
 
 # =====================
@@ -316,6 +364,14 @@ async def on_voice_state_update(member, before, after):
 
     if before.channel and before.channel.id == stay and after.channel is None:
         await enqueue_audio(gid, stay, "tts_short", f"{name}おつかれ")
+
+    guild = member.guild
+    stay_ch = guild.get_channel(stay)
+    if isinstance(stay_ch, discord.VoiceChannel):
+        if non_bot_count(stay_ch) == 0:
+            await schedule_empty_disconnect(gid, stay)
+        else:
+            cancel_empty_timer(gid)
 
 # =====================
 # Ready
